@@ -1,0 +1,46 @@
+{
+  "propertyId": "PROP-1001",
+  "requestedRange": {
+    "from": "2026-06-29",
+    "to": "2026-07-02"
+  },
+  "nights": [
+    {
+      "date": "2026-06-29",
+      "unitsAvailable": 3,
+      "minStay": 1,
+      "bookable": true,
+      "restrictions": []
+    },
+    {
+      "date": "2026-06-30",
+      "unitsAvailable": 3,
+      "minStay": 1,
+      "bookable": true,
+      "restrictions": []
+    },
+    {
+      "date": "2026-07-01",
+      "unitsAvailable": 3,
+      "minStay": 1,
+      "bookable": true,
+      "restrictions": []
+    },
+    {
+      "date": "2026-07-02",
+      "unitsAvailable": 3,
+      "minStay": 1,
+      "bookable": true,
+      "restrictions": []
+    }
+  ],
+  "summary": {
+    "totalNights": 4,
+    "bookableNights": 4,
+    "fullyAvailable": true
+  },
+  "meta": {
+    "source": "system-property-api",
+    "correlationId": "test-correlation-id"
+  }
+}

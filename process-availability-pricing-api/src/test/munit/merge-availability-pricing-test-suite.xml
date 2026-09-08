@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    Transformation tests for merge-availability-pricing.dwl.
+
+    The merge sub-flow takes its inputs from variables, so every test here is pure:
+    no HTTP, no object store, no clock. That is the whole reason the transformation
+    was factored out of the request flow.
+
+    Fixture stay: PROP-1001, 2026-06-01 .. 2026-06-05 (5 nights).
+    Nightly EUR rates: 120, 120, 150, 150, 180  ->  subtotal 720 at 2 guests.
+    Tax rate comes from config (pricing.defaultTaxRate = 0.10).
+  -->
+
+  <munit:config name="merge-availability-pricing-test-suite.xml"/>
+
+  <!-- Loaded once and reused; keeps each test body about the assertion, not the setup. -->
+  <munit:before-test name="load-fixtures" description="Load canonical fixtures">
+    <ee:transform doc:name="Read fixtures">
+      <ee:variables>
+        <ee:set-variable variableName="fxAvailabilityHappy"><![CDATA[#[readUrl('classpath://fixtures/availability-happy.json', 'application/json')]]]></ee:set-variable>
+        <ee:set-variable variableName="fxAvailabilityClosed"><![CDATA[#[readUrl('classpath://fixtures/availability-closed-night.json', 'application/json')]]]></ee:set-variable>
+        <ee:set-variable variableName="fxAvailabilityTwoMonths"><![CDATA[#[readUrl('classpath://fixtures/availability-two-months.json', 'application/json')]]]></ee:set-variable>
+        <ee:set-variable variableName="fxRatesEur"><![CDATA[#[readUrl('classpath://fixtures/rates-eur.json', 'application/json')]]]></ee:set-variable>
+        <ee:set-variable variableName="fxRatesMissing"><![CDATA[#[readUrl('classpath://fixtures/rates-missing-night.json', 'application/json')]]]></ee:set-variable>
+        <ee:set-variable variableName="fxRatesTwoMonths"><![CDATA[#[readUrl('classpath://fixtures/rates-two-months.json', 'application/json')]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </munit:before-test>
+
+  <munit:test name="merge-prices-a-fully-available-stay"
+              description="Every night open and priced yields a quotable stay with the expected totals">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.quotable]"
+                               is="#[MunitTools::equalTo(true)]"
+                               message="A stay with every night open and priced must be quotable"/>
+      <munit-tools:assert-that expression="#[payload.stay.nights]"
+                               is="#[MunitTools::equalTo(5)]"
+                               message="All five requested nights should be present"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(720.00)]"
+                               message="120 + 120 + 150 + 150 + 180 = 720"/>
+      <munit-tools:assert-that expression="#[payload.pricing.tax]"
+                               is="#[MunitTools::equalTo(72.00)]"
+                               message="10% of 720"/>
+      <munit-tools:assert-that expression="#[payload.pricing.total]"
+                               is="#[MunitTools::equalTo(792.00)]"
+                               message="Subtotal plus tax"/>
+      <munit-tools:assert-that expression="#[payload.pricing.averageNightly]"
+                               is="#[MunitTools::equalTo(144.00)]"
+                               message="720 over 5 quotable nights"/>
+      <munit-tools:assert-that expression="#[payload.pricing.totalFormatted]"
+                               is="#[MunitTools::equalTo('€792.00')]"
+                               message="Money is rendered with a symbol and thousands separators"/>
+      <munit-tools:assert-that expression="#[payload.gaps.unavailableDates]"
+                               is="#[MunitTools::equalTo([])]"
+                               message="Nothing should be reported as unavailable"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-marks-weekend-nights-and-promotions"
+              description="Day-of-week derivation and promotion pass-through">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <!-- 2026-06-01 is a Monday; the transformation derives this, it is not in the fixture. -->
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].nights[0].dayOfWeek]"
+                               is="#[MunitTools::equalTo('Monday')]"
+                               message="Day names must be derived from the date"/>
+      <munit-tools:assert-that expression="#[payload.pricing.weekendNights]"
+                               is="#[MunitTools::equalTo(1)]"
+                               message="Only 2026-06-05 (Friday) is a weekend night in this range"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].nights[4].promotionCode]"
+                               is="#[MunitTools::equalTo('SUMMER26')]"
+                               message="A promotion on the rate must survive the merge"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-applies-occupancy-surcharge-above-two-guests"
+              description="Each guest beyond two adds 15% to every night">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[4]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.pricing.occupancyMultiplier]"
+                               is="#[MunitTools::equalTo(1.3)]"
+                               message="Two extra guests = 1 + 2 x 0.15"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(936.00)]"
+                               message="720 x 1.3"/>
+      <munit-tools:assert-that expression="#[payload.pricing.total]"
+                               is="#[MunitTools::equalTo(1029.60)]"
+                               message="936 plus 10% tax"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-converts-currency-and-rounds-once"
+              description="EUR rates quoted in USD are converted per night and rounded to cents">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="USD" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.currency]"
+                               is="#[MunitTools::equalTo('USD')]"/>
+      <munit-tools:assert-that expression="#[payload.pricing.converted]"
+                               is="#[MunitTools::equalTo(true)]"
+                               message="The response must admit that the price was converted"/>
+      <munit-tools:assert-that expression="#[payload.pricing.sourceCurrency]"
+                               is="#[MunitTools::equalTo('EUR')]"/>
+      <!-- 120 / 0.92 = 130.4347... -> 130.43 -->
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].nights[0].amount]"
+                               is="#[MunitTools::equalTo(130.43)]"
+                               message="Per-night conversion is rounded to cents"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(782.59)]"
+                               message="130.43 + 130.43 + 163.04 + 163.04 + 195.65"/>
+      <munit-tools:assert-that expression="#[payload.pricing.total]"
+                               is="#[MunitTools::equalTo(860.85)]"
+                               message="782.59 plus 78.26 tax"/>
+      <munit-tools:assert-that expression="#[payload.pricing.totalFormatted]"
+                               is="#[MunitTools::equalTo('$860.85')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-excludes-closed-nights-from-the-price"
+              description="A closed night makes the stay unquotable and is reported explicitly">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityClosed]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.quotable]"
+                               is="#[MunitTools::equalTo(false)]"
+                               message="One closed night must make the whole stay unquotable"/>
+      <munit-tools:assert-that expression="#[payload.gaps.unavailableDates]"
+                               is="#[MunitTools::equalTo(['2026-06-02'])]"
+                               message="The caller needs the exact date, not just a failure"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(600.00)]"
+                               message="720 minus the 120 for the closed night"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].nights[1].restrictions]"
+                               is="#[MunitTools::equalTo(['CLOSED'])]"
+                               message="Restriction codes survive the merge"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-separates-unpriced-nights-from-unavailable-ones"
+              description="An open night with no matching rate is unpriced, not unavailable">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesMissing]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.gaps.unpricedDates]"
+                               is="#[MunitTools::equalTo(['2026-06-03'])]"
+                               message="The night with no rate must be reported as unpriced"/>
+      <munit-tools:assert-that expression="#[payload.gaps.unavailableDates]"
+                               is="#[MunitTools::equalTo([])]"
+                               message="It is open, so it is not unavailable"/>
+      <munit-tools:assert-that expression="#[payload.quotable]"
+                               is="#[MunitTools::equalTo(false)]"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(570.00)]"
+                               message="720 minus the missing 150"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].nights[2].amount]"
+                               is="#[MunitTools::nullValue()]"
+                               message="No rate means no invented price"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-returns-no-price-for-an-unknown-currency"
+              description="An unsupported currency yields nulls rather than an unconverted number">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityHappy]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesEur]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="XYZ" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.quotable]"
+                               is="#[MunitTools::equalTo(false)]"
+                               message="Refusing to quote is safer than quoting the wrong currency"/>
+      <munit-tools:assert-that expression="#[sizeOf(payload.gaps.unpricedDates)]"
+                               is="#[MunitTools::equalTo(5)]"
+                               message="Every night is unpriced when conversion is impossible"/>
+      <munit-tools:assert-that expression="#[payload.pricing.subtotal]"
+                               is="#[MunitTools::equalTo(0)]"/>
+      <munit-tools:assert-that expression="#[payload.pricing.averageNightly]"
+                               is="#[MunitTools::nullValue()]"
+                               message="No division by zero when nothing is quotable"/>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="merge-groups-a-stay-that-spans-two-months"
+              description="Nights are grouped by calendar month with per-month subtotals">
+    <munit:behavior>
+      <set-variable variableName="availability" value="#[vars.fxAvailabilityTwoMonths]" doc:name="availability"/>
+      <set-variable variableName="rates" value="#[vars.fxRatesTwoMonths]" doc:name="rates"/>
+      <set-variable variableName="guests" value="#[2]" doc:name="guests"/>
+      <set-variable variableName="targetCurrency" value="EUR" doc:name="currency"/>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="merge-availability-and-pricing" doc:name="Merge"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[sizeOf(keysOf(payload.calendar))]"
+                               is="#[MunitTools::equalTo(2)]"
+                               message="June and July must be separate blocks"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].label]"
+                               is="#[MunitTools::equalTo('June 2026')]"
+                               message="Month labels are rendered, not passed through"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-06'].monthSubtotal]"
+                               is="#[MunitTools::equalTo(200.00)]"
+                               message="Two June nights at 100"/>
+      <munit-tools:assert-that expression="#[payload.calendar['2026-07'].monthSubtotal]"
+                               is="#[MunitTools::equalTo(200.00)]"
+                               message="Two July nights at 100"/>
+      <munit-tools:assert-that expression="#[payload.pricing.total]"
+                               is="#[MunitTools::equalTo(440.00)]"
+                               message="400 plus 10% tax"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>

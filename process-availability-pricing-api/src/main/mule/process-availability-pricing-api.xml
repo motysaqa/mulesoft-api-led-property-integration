@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    PROCESS API - Availability and pricing
+    Orchestrates the two system APIs and owns the business rule that turns
+    "which nights are open" plus "what does a night cost" into one quotable stay.
+    It holds no backend knowledge and no channel-specific formatting.
+  -->
+
+  <flow name="process-api-health" doc:name="GET /health">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/health" allowedMethods="GET" doc:name="Listener"/>
+    <ee:transform doc:name="Health payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "UP", api: "process-availability-pricing-api" }]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <!--
+    Thin orchestration on purpose: property search touches one system of record, so
+    the process layer only enforces the search contract and leaves the canonical
+    shape alone. Routing it through here still matters - the experience layer never
+    gets a direct line to a system API, which is what keeps the layering enforceable.
+  -->
+  <flow name="process-api-list-properties" doc:name="GET /properties">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/properties" allowedMethods="GET" doc:name="Listener">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <http:request method="GET" config-ref="property-system-api-config"
+                  path="${systemApi.property.basePath}/properties"
+                  responseTimeout="${systemApi.property.responseTimeoutMs}"
+                  doc:name="GET properties">
+      <http:query-params><![CDATA[#[attributes.queryParams filterObject ((v, k) -> ["city", "minCapacity"] contains (k as String))]]]></http:query-params>
+    </http:request>
+
+    <ee:transform doc:name="Drop inactive listings">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  // Inactive inventory must never reach a sales channel.
+  properties: (payload.properties default []) filter ((p) -> p.active default false),
+  meta: {
+    count: sizeOf((payload.properties default []) filter ((p) -> p.active default false)),
+    source: "process-availability-pricing-api",
+    correlationId: correlationId
+  }
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="process-api-availability-pricing" doc:name="GET /properties/{propertyId}/availability-pricing">
+    <http:listener config-ref="http-listener-config"
+                   path="${http.basePath}/properties/{propertyId}/availability-pricing"
+                   allowedMethods="GET" doc:name="Listener">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <ee:transform doc:name="Capture request parameters">
+      <ee:variables>
+        <ee:set-variable variableName="propertyId"><![CDATA[#[attributes.uriParams.propertyId]]]></ee:set-variable>
+        <ee:set-variable variableName="fromDate"><![CDATA[#[attributes.queryParams.from default ""]]]></ee:set-variable>
+        <ee:set-variable variableName="toDate"><![CDATA[#[attributes.queryParams.to default ""]]]></ee:set-variable>
+        <ee:set-variable variableName="guests"><![CDATA[#[(attributes.queryParams.guests default "1") as Number]]]></ee:set-variable>
+        <ee:set-variable variableName="ratePlanCode"><![CDATA[#[attributes.queryParams.ratePlanCode default "STD"]]]></ee:set-variable>
+        <ee:set-variable variableName="targetCurrency"><![CDATA[#[upper(attributes.queryParams.currency default p('pricing.outputCurrency'))]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <choice doc:name="Request valid?">
+      <when expression="#[!((vars.fromDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.toDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.fromDate &lt;= vars.toDate) and (vars.guests &gt;= 1))]">
+        <raise-error type="PROCESS:BAD_REQUEST"
+                     description="from/to must be ISO dates (yyyy-MM-dd) with from not after to, and guests must be at least 1"
+                     doc:name="Raise 400"/>
+      </when>
+      <otherwise>
+        <logger level="INFO" doc:name="Log request"
+                message="#[output application/json --- { event: 'request_received', api: 'process-availability-pricing-api', correlationId: correlationId, propertyId: vars.propertyId, from: vars.fromDate, to: vars.toDate, guests: vars.guests }]"/>
+      </otherwise>
+    </choice>
+
+    <!--
+      Both system APIs are independent, so they run in parallel. Sequential calls
+      would make the worst-case latency the sum of two backends instead of the max.
+    -->
+    <scatter-gather doc:name="Fetch availability and rates in parallel" timeout="12000">
+      <route>
+        <flow-ref name="get-availability" doc:name="System API: availability"/>
+      </route>
+      <route>
+        <flow-ref name="get-rates-cached" doc:name="System API: rates (cached)"/>
+      </route>
+    </scatter-gather>
+
+    <ee:transform doc:name="Unpack scatter-gather results">
+      <ee:variables>
+        <ee:set-variable variableName="availability"><![CDATA[#[payload["0"].payload]]]></ee:set-variable>
+        <ee:set-variable variableName="rates"><![CDATA[#[payload["1"].payload]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <flow-ref name="merge-availability-and-pricing" doc:name="Merge and price"/>
+  </flow>
+
+  <sub-flow name="get-availability">
+    <http:request method="GET" config-ref="property-system-api-config"
+                  path="${systemApi.property.basePath}/properties/{propertyId}/availability"
+                  responseTimeout="${systemApi.property.responseTimeoutMs}"
+                  doc:name="GET availability">
+      <http:uri-params><![CDATA[#[{ propertyId: vars.propertyId }]]]></http:uri-params>
+      <http:query-params><![CDATA[#[{ from: vars.fromDate, to: vars.toDate }]]]></http:query-params>
+      <!-- A 404 from the system layer must stay a 404 here, not become a 502. -->
+      <http:response-validator>
+        <http:success-status-code-validator values="200..299,404"/>
+      </http:response-validator>
+    </http:request>
+
+    <choice doc:name="Property exists?">
+      <when expression="#[(payload.propertyId default null) == null]">
+        <raise-error type="PROCESS:NOT_FOUND"
+                     description="#['No property with id ' ++ (vars.propertyId default 'unknown')]"
+                     doc:name="Raise 404"/>
+      </when>
+      <otherwise>
+        <logger level="DEBUG" doc:name="Availability received"
+                message="#[output application/json --- { event: 'availability_received', nights: sizeOf(payload.nights default []) }]"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <!--
+    Rate calendars are stable for minutes at a time, so they are served from an
+    object store keyed by property + rate plan + date range. A cache hit removes
+    an entire SOAP round trip from the request path.
+  -->
+  <sub-flow name="get-rates-cached">
+    <set-variable variableName="ratesCacheKey"
+                  value="#[vars.propertyId ++ '|' ++ vars.ratePlanCode ++ '|' ++ vars.fromDate ++ '|' ++ vars.toDate]"
+                  doc:name="Build cache key"/>
+
+    <os:retrieve key="#[vars.ratesCacheKey]" objectStore="rates-cache" target="cachedRates" doc:name="Cache lookup">
+      <os:default-value><![CDATA[#[null]]]></os:default-value>
+    </os:retrieve>
+
+    <choice doc:name="Cache hit?">
+      <when expression="#[vars.cachedRates != null]">
+        <logger level="DEBUG" doc:name="Cache hit"
+                message="#[output application/json --- { event: 'rates_cache_hit', key: vars.ratesCacheKey }]"/>
+        <set-payload value="#[vars.cachedRates]" doc:name="Serve from cache"/>
+      </when>
+      <otherwise>
+        <http:request method="GET" config-ref="rates-system-api-config"
+                      path="${systemApi.rates.basePath}/rates"
+                      responseTimeout="${systemApi.rates.responseTimeoutMs}"
+                      doc:name="GET rates">
+          <http:query-params><![CDATA[#[{
+            propertyId: vars.propertyId,
+            ratePlanCode: vars.ratePlanCode,
+            from: vars.fromDate,
+            to: vars.toDate
+          }]]]></http:query-params>
+        </http:request>
+        <os:store key="#[vars.ratesCacheKey]" objectStore="rates-cache" failIfPresent="false" doc:name="Cache store">
+          <os:value><![CDATA[#[payload]]]></os:value>
+        </os:store>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+  <!--
+    Kept as its own sub-flow so MUnit can exercise the transformation with fixed
+    fixtures, with no HTTP, no object store and no clock involved.
+  -->
+  <sub-flow name="merge-availability-and-pricing">
+    <ee:transform doc:name="Merge availability with rates">
+      <ee:message>
+        <ee:set-payload resource="dwl/merge-availability-pricing.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </sub-flow>
+
+</mule>

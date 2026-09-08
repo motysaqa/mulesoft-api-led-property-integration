@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <global-property name="mule.env" value="dev"/>
+  <configuration-properties file="config-${mule.env}.yaml" doc:name="Environment properties"/>
+
+  <configuration defaultErrorHandler-ref="global-error-handler" doc:name="Runtime configuration"/>
+
+  <http:listener-config name="http-listener-config" doc:name="HTTP Listener">
+    <http:listener-connection host="${http.host}" port="${http.port}"/>
+  </http:listener-config>
+
+  <http:request-config name="property-system-api-config" doc:name="System API - Property">
+    <http:request-connection protocol="${systemApi.property.protocol}"
+                             host="${systemApi.property.host}"
+                             port="${systemApi.property.port}"/>
+    <http:default-headers>
+      <http:default-header key="Accept" value="application/json"/>
+      <http:default-header key="X-Correlation-ID" value="#[correlationId]"/>
+    </http:default-headers>
+  </http:request-config>
+
+  <http:request-config name="rates-system-api-config" doc:name="System API - Rates">
+    <http:request-connection protocol="${systemApi.rates.protocol}"
+                             host="${systemApi.rates.host}"
+                             port="${systemApi.rates.port}"/>
+    <http:default-headers>
+      <http:default-header key="Accept" value="application/json"/>
+      <http:default-header key="X-Correlation-ID" value="#[correlationId]"/>
+    </http:default-headers>
+  </http:request-config>
+
+  <!--
+    Rate calendars change far less often than availability, so they are cached for
+    a few minutes. This is the in-memory store; on CloudHub the same config with
+    persistent="true" gives a cluster-wide store. Availability is deliberately NOT
+    cached: overselling a night is worse than an extra backend call.
+  -->
+  <os:object-store name="rates-cache"
+                   persistent="false"
+                   maxEntries="500"
+                   entryTtl="${pricing.cache.ttlSeconds}"
+                   entryTtlUnit="SECONDS"
+                   expirationInterval="60"
+                   expirationIntervalUnit="SECONDS"
+                   doc:name="Rates cache"/>
+
+  <error-handler name="global-error-handler" doc:name="Global error handler">
+
+    <on-error-propagate type="PROCESS:NOT_FOUND" logException="false" doc:name="404 Not found">
+      <ee:transform doc:name="Not found envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: {
+    code: "PROPERTY_NOT_FOUND",
+    message: error.description default "The requested property does not exist",
+    layer: "process-availability-pricing-api",
+    correlationId: correlationId,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+  }
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="PROCESS:BAD_REQUEST, EXPRESSION" logException="false" doc:name="400 Bad request">
+      <ee:transform doc:name="Bad request envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: {
+    code: "BAD_REQUEST",
+    message: error.description default "The request could not be understood",
+    layer: "process-availability-pricing-api",
+    correlationId: correlationId,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+  }
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!--
+      Scatter-gather reports partial failure as MULE:COMPOSITE_ROUTING. Both
+      branches are system APIs, and a merged answer missing either half would be
+      wrong rather than incomplete, so this is surfaced as a 502.
+    -->
+    <on-error-propagate type="MULE:COMPOSITE_ROUTING, HTTP:TIMEOUT, HTTP:CONNECTIVITY, HTTP:BAD_GATEWAY, HTTP:SERVICE_UNAVAILABLE, HTTP:INTERNAL_SERVER_ERROR, RETRY_EXHAUSTED"
+                        logException="true" doc:name="502 Downstream failure">
+      <logger level="ERROR" doc:name="Log downstream failure"
+              message="#[output application/json --- { event: 'downstream_failure', correlationId: correlationId, errorType: error.errorType.identifier default 'UNKNOWN', failedRoutes: ((error.errorMessage.payload.failures default []) map ((f) -> f.routeIndex default -1)) }]"/>
+      <ee:transform doc:name="Downstream failure envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: {
+    code: "DOWNSTREAM_UNAVAILABLE",
+    message: "One of the system APIs did not return a usable response",
+    layer: "process-availability-pricing-api",
+    correlationId: correlationId,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+  }
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">502</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="ANY" logException="true" doc:name="500 Unexpected">
+      <ee:transform doc:name="Internal error envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  error: {
+    code: "INTERNAL_ERROR",
+    message: "An unexpected error occurred while processing the request",
+    layer: "process-availability-pricing-api",
+    correlationId: correlationId,
+    timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+  }
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+  </error-handler>
+</mule>

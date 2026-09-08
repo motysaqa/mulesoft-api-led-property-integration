@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    Error and caching behaviour of the orchestration sub-flows.
+
+    Every downstream call is mocked, so these tests describe what the process API
+    does when a system API misbehaves - which is the part that actually breaks in
+    production and the part that is hardest to reproduce by hand.
+  -->
+
+  <munit:config name="error-paths-test-suite.xml"/>
+
+  <munit:before-test name="set-request-variables" description="Standard request context">
+    <ee:transform doc:name="Request variables">
+      <ee:variables>
+        <ee:set-variable variableName="propertyId">PROP-1001</ee:set-variable>
+        <ee:set-variable variableName="ratePlanCode">STD</ee:set-variable>
+        <ee:set-variable variableName="fromDate">2026-06-01</ee:set-variable>
+        <ee:set-variable variableName="toDate">2026-06-05</ee:set-variable>
+        <ee:set-variable variableName="guests"><![CDATA[#[2]]]></ee:set-variable>
+        <ee:set-variable variableName="targetCurrency">EUR</ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+  </munit:before-test>
+
+  <munit:after-test name="clear-rates-cache" description="Keep tests independent of each other">
+    <munit-tools:clear-object-store objectStore="rates-cache" doc:name="Clear cache"/>
+  </munit:after-test>
+
+  <munit:test name="unknown-property-becomes-a-404-not-a-502"
+              description="A system API 404 must stay a 404 through the process layer"
+              expectedErrorType="PROCESS:NOT_FOUND">
+    <munit:behavior>
+      <!-- The system API answers 404 with an error envelope, so there is no propertyId. -->
+      <munit-tools:mock-when processor="http:request" doc:name="Mock availability 404">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="property-system-api-config"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload value='#[output application/json --- { error: { code: "PROPERTY_NOT_FOUND" } }]'/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="get-availability" doc:name="Fetch availability"/>
+    </munit:execution>
+  </munit:test>
+
+  <munit:test name="rates-timeout-propagates-for-the-global-handler-to-map"
+              description="A timed-out system API surfaces as HTTP:TIMEOUT, which the handler turns into a 502"
+              expectedErrorType="HTTP:TIMEOUT">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request" doc:name="Mock rates timeout">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="rates-system-api-config"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:error typeId="HTTP:TIMEOUT"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <flow-ref name="get-rates-cached" doc:name="Fetch rates"/>
+    </munit:execution>
+  </munit:test>
+
+  <munit:test name="a-cached-rate-calendar-skips-the-system-api-entirely"
+              description="A cache hit must remove the downstream call, not just reuse its result">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request" doc:name="Mock rates (should not be reached)">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="rates-system-api-config"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[readUrl('classpath://fixtures/rates-eur.json', 'application/json')]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <!-- Key shape must match the one the sub-flow builds: property|plan|from|to. -->
+      <os:store key="PROP-1001|STD|2026-06-01|2026-06-05" objectStore="rates-cache" failIfPresent="false" doc:name="Prime cache">
+        <os:value><![CDATA[#[readUrl('classpath://fixtures/rates-eur.json', 'application/json')]]]></os:value>
+      </os:store>
+    </munit:behavior>
+
+    <munit:execution>
+      <flow-ref name="get-rates-cached" doc:name="Fetch rates"/>
+    </munit:execution>
+
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.propertyId]"
+                               is="#[MunitTools::equalTo('PROP-1001')]"
+                               message="The cached calendar should be served as-is"/>
+      <munit-tools:assert-that expression="#[sizeOf(payload.rates)]"
+                               is="#[MunitTools::equalTo(5)]"/>
+      <munit-tools:verify-call processor="http:request" times="0" doc:name="No downstream call">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="rates-system-api-config"/>
+        </munit-tools:with-attributes>
+      </munit-tools:verify-call>
+    </munit:validation>
+  </munit:test>
+
+  <munit:test name="a-cache-miss-calls-the-system-api-once-and-stores-the-result"
+              description="The miss path must populate the cache, otherwise the TTL never helps">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request" doc:name="Mock rates response">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="rates-system-api-config"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[readUrl('classpath://fixtures/rates-eur.json', 'application/json')]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+
+    <munit:execution>
+      <flow-ref name="get-rates-cached" doc:name="Fetch rates"/>
+    </munit:execution>
+
+    <munit:validation>
+      <munit-tools:verify-call processor="http:request" times="1" doc:name="Exactly one downstream call">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="config-ref" whereValue="rates-system-api-config"/>
+        </munit-tools:with-attributes>
+      </munit-tools:verify-call>
+      <os:retrieve key="PROP-1001|STD|2026-06-01|2026-06-05" objectStore="rates-cache" target="stored" doc:name="Read back cache">
+        <os:default-value><![CDATA[#[null]]]></os:default-value>
+      </os:retrieve>
+      <munit-tools:assert-that expression="#[vars.stored]"
+                               is="#[MunitTools::notNullValue()]"
+                               message="The response must have been written to the cache"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>

@@ -1,0 +1,47 @@
+{
+  "propertyId": "PROP-1001",
+  "ratePlanCode": "STD",
+  "currency": "EUR",
+  "rates": [
+    {
+      "date": "2026-06-01",
+      "amount": 120.0,
+      "amountMinor": 12000,
+      "taxIncluded": false,
+      "promotionCode": null
+    },
+    {
+      "date": "2026-06-02",
+      "amount": 120.0,
+      "amountMinor": 12000,
+      "taxIncluded": false,
+      "promotionCode": null
+    },
+    {
+      "date": "2026-06-03",
+      "amount": 150.0,
+      "amountMinor": 15000,
+      "taxIncluded": false,
+      "promotionCode": null
+    },
+    {
+      "date": "2026-06-04",
+      "amount": 150.0,
+      "amountMinor": 15000,
+      "taxIncluded": false,
+      "promotionCode": null
+    },
+    {
+      "date": "2026-06-05",
+      "amount": 180.0,
+      "amountMinor": 18000,
+      "taxIncluded": false,
+      "promotionCode": "SUMMER26"
+    }
+  ],
+  "meta": {
+    "count": 5,
+    "source": "system-legacy-rates-soap-api",
+    "correlationId": "test-correlation-id"
+  }
+}

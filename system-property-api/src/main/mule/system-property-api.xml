@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    SYSTEM API - Property backend
+    Owns one system of record (the property/inventory backend) and nothing else.
+    It exposes a stable canonical shape so the process layer never sees the
+    backend's field names, and it is the only place that knows the backend URL.
+  -->
+
+  <flow name="system-property-api-health" doc:name="GET /health">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/health" allowedMethods="GET" doc:name="Listener"/>
+    <ee:transform doc:name="Health payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "UP", api: "system-property-api" }]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="system-property-api-list-properties" doc:name="GET /properties">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/properties" allowedMethods="GET" doc:name="Listener">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <logger level="INFO" doc:name="Log request"
+            message="#[output application/json --- { event: 'request_received', api: 'system-property-api', operation: 'listProperties', correlationId: correlationId, query: attributes.queryParams }]"/>
+
+    <flow-ref name="call-backend-list-properties" doc:name="Call backend (with retry)"/>
+
+    <ee:transform doc:name="Backend to canonical">
+      <ee:message>
+        <ee:set-payload resource="dwl/properties-to-canonical.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="system-property-api-get-availability" doc:name="GET /properties/{propertyId}/availability">
+    <http:listener config-ref="http-listener-config"
+                   path="${http.basePath}/properties/{propertyId}/availability"
+                   allowedMethods="GET" doc:name="Listener">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <ee:transform doc:name="Capture request parameters">
+      <ee:variables>
+        <ee:set-variable variableName="propertyId"><![CDATA[#[attributes.uriParams.propertyId]]]></ee:set-variable>
+        <ee:set-variable variableName="fromDate"><![CDATA[#[attributes.queryParams.from default (now() as Date) as String {format: "yyyy-MM-dd"}]]]></ee:set-variable>
+        <ee:set-variable variableName="toDate"><![CDATA[#[attributes.queryParams.to default ((now() as Date) + |P30D|) as String {format: "yyyy-MM-dd"}]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <!--
+      Fail fast with a 400 rather than forwarding a nonsense range to the backend.
+      raise-error keeps the error type inside our own namespace so the global
+      handler can map it without string matching on messages.
+    -->
+    <choice doc:name="Valid date range?">
+      <!-- ISO-8601 dates sort lexicographically, so a string compare is a correct
+           range check once both values are known to match yyyy-MM-dd. -->
+      <when expression="#[!((vars.fromDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.toDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.fromDate &lt;= vars.toDate))]">
+        <raise-error type="PROPERTY:BAD_REQUEST"
+                     description="Query parameters 'from' and 'to' must be ISO dates (yyyy-MM-dd) and 'from' must not be after 'to'"
+                     doc:name="Raise 400"/>
+      </when>
+      <otherwise>
+        <logger level="DEBUG" doc:name="Range accepted"
+                message="#[output application/json --- { event: 'range_accepted', propertyId: vars.propertyId, from: vars.fromDate, to: vars.toDate }]"/>
+      </otherwise>
+    </choice>
+
+    <flow-ref name="call-backend-availability" doc:name="Call backend (with retry)"/>
+
+    <ee:transform doc:name="Backend to canonical">
+      <ee:message>
+        <ee:set-payload resource="dwl/availability-to-canonical.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <!--
+    Retry with backoff.
+    Mule's until-successful uses a fixed interval, so two nested scopes approximate
+    exponential backoff: the inner scope retries quickly (500 ms) for a blip, the
+    outer scope waits ~2 s before repeating that burst. Worst case is roughly four
+    attempts over ~3 s, after which RETRY_EXHAUSTED reaches the global handler and
+    the caller gets a 502 with a correlation id.
+  -->
+  <sub-flow name="call-backend-list-properties">
+    <until-successful maxRetries="1" millisBetweenRetries="2000" doc:name="Outer backoff 2s">
+      <until-successful maxRetries="${resilience.retry.maxAttempts}"
+                        millisBetweenRetries="${resilience.retry.initialBackoffMs}"
+                        doc:name="Inner retry 500ms">
+        <http:request method="GET"
+                      config-ref="property-backend-request-config"
+                      path="${property.backend.basePath}/properties"
+                      responseTimeout="${property.backend.responseTimeoutMs}"
+                      target="backendProperties"
+                      doc:name="GET backend /properties">
+          <http:query-params><![CDATA[#[attributes.queryParams filterObject ((v, k) -> ["city", "minCapacity"] contains (k as String))]]]></http:query-params>
+        </http:request>
+      </until-successful>
+    </until-successful>
+    <set-payload value="#[vars.backendProperties]" doc:name="Promote backend payload"/>
+  </sub-flow>
+
+  <sub-flow name="call-backend-availability">
+    <until-successful maxRetries="1" millisBetweenRetries="2000" doc:name="Outer backoff 2s">
+      <until-successful maxRetries="${resilience.retry.maxAttempts}"
+                        millisBetweenRetries="${resilience.retry.initialBackoffMs}"
+                        doc:name="Inner retry 500ms">
+        <http:request method="GET"
+                      config-ref="property-backend-request-config"
+                      path="${property.backend.basePath}/properties/{propertyId}/availability"
+                      responseTimeout="${property.backend.responseTimeoutMs}"
+                      target="backendAvailability"
+                      doc:name="GET backend availability">
+          <http:uri-params><![CDATA[#[{ propertyId: vars.propertyId }]]]></http:uri-params>
+          <http:query-params><![CDATA[#[{ from: vars.fromDate, to: vars.toDate }]]]></http:query-params>
+          <!-- 404 is a business answer, not a transport failure: it must not be retried. -->
+          <http:response-validator>
+            <http:success-status-code-validator values="200..299,404"/>
+          </http:response-validator>
+        </http:request>
+      </until-successful>
+    </until-successful>
+
+    <choice doc:name="Backend found the property?">
+      <when expression="#[(vars.backendAvailability.propertyId default null) == null]">
+        <raise-error type="PROPERTY:NOT_FOUND"
+                     description="#['No property with id ' ++ (vars.propertyId default 'unknown')]"
+                     doc:name="Raise 404"/>
+      </when>
+      <otherwise>
+        <set-payload value="#[vars.backendAvailability]" doc:name="Promote backend payload"/>
+      </otherwise>
+    </choice>
+  </sub-flow>
+
+</mule>

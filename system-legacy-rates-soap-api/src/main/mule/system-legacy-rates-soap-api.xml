@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:wsc="http://www.mulesoft.org/schema/mule/wsc"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/wsc http://www.mulesoft.org/schema/mule/wsc/current/mule-wsc.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    SYSTEM API - Legacy rates (SOAP)
+    Turns a document/literal SOAP service into a JSON REST resource. Callers above
+    this layer never build a SOAP envelope, never see minor-unit integers, and
+    never have to know the operation is called GetRates.
+  -->
+
+  <flow name="system-rates-api-health" doc:name="GET /health">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/health" allowedMethods="GET" doc:name="Listener"/>
+    <ee:transform doc:name="Health payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "UP", api: "system-legacy-rates-soap-api" }]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="system-rates-api-get-rates" doc:name="GET /rates">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/rates" allowedMethods="GET" doc:name="Listener">
+      <http:response statusCode="200">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[{ "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+
+    <ee:transform doc:name="Capture request parameters">
+      <ee:variables>
+        <ee:set-variable variableName="propertyId"><![CDATA[#[attributes.queryParams.propertyId default ""]]]></ee:set-variable>
+        <ee:set-variable variableName="ratePlanCode"><![CDATA[#[attributes.queryParams.ratePlanCode default "STD"]]]></ee:set-variable>
+        <ee:set-variable variableName="fromDate"><![CDATA[#[attributes.queryParams.from default ""]]]></ee:set-variable>
+        <ee:set-variable variableName="toDate"><![CDATA[#[attributes.queryParams.to default ""]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <choice doc:name="Request complete?">
+      <when expression="#[!((vars.propertyId != '') and (vars.fromDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.toDate matches /^\d{4}-\d{2}-\d{2}$/) and (vars.fromDate &lt;= vars.toDate))]">
+        <raise-error type="RATES:BAD_REQUEST"
+                     description="propertyId is required and from/to must be ISO dates (yyyy-MM-dd) with from not after to"
+                     doc:name="Raise 400"/>
+      </when>
+      <otherwise>
+        <logger level="INFO" doc:name="Log request"
+                message="#[output application/json --- { event: 'request_received', api: 'system-legacy-rates-soap-api', operation: 'getRates', correlationId: correlationId, propertyId: vars.propertyId, ratePlanCode: vars.ratePlanCode }]"/>
+      </otherwise>
+    </choice>
+
+    <flow-ref name="call-legacy-rates-service" doc:name="Call SOAP service (with retry)"/>
+
+    <ee:transform doc:name="SOAP to canonical">
+      <ee:message>
+        <ee:set-payload resource="dwl/rates-to-canonical.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <!-- Same nested-scope backoff shape as the property system API: quick retries
+       for a blip, one longer pause, then give up and report a 502. -->
+  <sub-flow name="call-legacy-rates-service">
+    <until-successful maxRetries="1" millisBetweenRetries="2000" doc:name="Outer backoff 2s">
+      <until-successful maxRetries="${resilience.retry.maxAttempts}"
+                        millisBetweenRetries="${resilience.retry.initialBackoffMs}"
+                        doc:name="Inner retry 500ms">
+        <wsc:consume operation="GetRates" config-ref="legacy-rates-wsc-config" doc:name="GetRates">
+          <wsc:message>
+            <wsc:body><![CDATA[#[output application/xml
+ns rates http://legacy.rates.portfolio.com/
+---
+rates#GetRates: {
+  rates#PropertyId: vars.propertyId,
+  rates#RatePlanCode: vars.ratePlanCode,
+  rates#FromDate: vars.fromDate,
+  rates#ToDate: vars.toDate
+}]]]></wsc:body>
+          </wsc:message>
+        </wsc:consume>
+      </until-successful>
+    </until-successful>
+  </sub-flow>
+
+</mule>

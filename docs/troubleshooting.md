@@ -63,6 +63,33 @@ static uint StableHash(string value)
 same applies to `Guid.GetHashCode()`, `Random` without a seed, and
 `DateTime.Now` anywhere in a fixture.
 
+### `curl -f` swallowed the assertion it was meant to make
+
+**Where:** the GitHub Actions `verify` job, on its first run.
+
+```
+curl: (22) The requested URL returned error: 404
+##[error]Process completed with exit code 22.
+```
+
+**Cause:** the step asserting that an unknown property returns 404 was written as
+
+```bash
+curl -fsS -o /dev/null -w '%{http_code}
+'   "http://localhost:5081/backend/v1/properties/NOPE/availability" | grep -q 404
+```
+
+`-f` makes curl exit 22 on any 4xx, so the one status the assertion existed to
+observe killed the step before `grep` ever saw it. The mock was behaving
+correctly the whole time.
+
+**Fix:** drop `-f` for that call only. The other calls keep it, because there a
+non-2xx genuinely is a failure.
+
+**Wider lesson:** `-f` and "assert on the status code" are incompatible. Use
+`-f` when any error is a failure, and `-o /dev/null -w '%{http_code}'` without it
+when the status *is* the thing being tested.
+
 ### The MUnit suites have not been executed
 
 Stated plainly because the alternative is dishonest: Maven is not installed in the

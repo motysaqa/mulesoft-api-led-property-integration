@@ -1,0 +1,17 @@
+# Normalise to LF in the repository. Shell scripts must stay LF or they will not
+# run on Linux CI runners after a checkout on Windows.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.dwl   text eol=lf
+*.raml  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.xml   text eol=lf
+*.wsdl  text eol=lf
+*.cs    text eol=lf
+*.py    text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.jar   binary

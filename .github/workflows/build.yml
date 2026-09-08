@@ -1,0 +1,197 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that needs no credentials. This job must always be green.
+  verify:
+    name: Verify (no credentials required)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build the mock backends
+        run: |
+          dotnet build mocks/property-backend/PropertyBackend.Mock.csproj -c Release
+          dotnet build mocks/legacy-rates-soap/LegacyRates.Mock.csproj -c Release
+
+      - name: Smoke-test the mock backends
+        run: |
+          set -euo pipefail
+          dotnet run --project mocks/property-backend/PropertyBackend.Mock.csproj -c Release --no-build &
+          dotnet run --project mocks/legacy-rates-soap/LegacyRates.Mock.csproj -c Release --no-build &
+          for _ in $(seq 1 40); do
+            curl -fsS -o /dev/null http://localhost:5081/health \
+              && curl -fsS -o /dev/null http://localhost:5082/health && break
+            sleep 1
+          done
+          curl -fsS "http://localhost:5081/backend/v1/properties?city=Valencia" | tee /dev/stderr | grep -q PROP-1001
+          curl -fsS -o /dev/null -w '%{http_code}\n' \
+            "http://localhost:5081/backend/v1/properties/NOPE/availability" | grep -q 404
+          # A SOAP business error must come back as a fault with HTTP 500.
+          cat > /tmp/getrates.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+            <soap:Body>
+              <GetRates xmlns="http://legacy.rates.portfolio.com/">
+                <PropertyId>PROP-1001</PropertyId>
+                <RatePlanCode>STD</RatePlanCode>
+                <FromDate>2026-06-01</FromDate>
+                <ToDate>2026-06-03</ToDate>
+              </GetRates>
+            </soap:Body>
+          </soap:Envelope>
+          XML
+          curl -fsS -X POST -H 'Content-Type: text/xml' --data-binary @/tmp/getrates.xml \
+            http://localhost:5082/LegacyRatesService | grep -q GetRatesResponse
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: python -m pip install -r scripts/requirements.txt
+
+      - name: Byte-compile the automation scripts
+        run: python -m compileall -q scripts
+
+      - name: Validate every Mule XML and MUnit suite is well-formed
+        run: |
+          python - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+          bad = []
+          files = sorted(Path('.').rglob('src/main/mule/*.xml')) + \
+                  sorted(Path('.').rglob('src/test/munit/*.xml')) + \
+                  sorted(Path('.').rglob('*.wsdl')) + \
+                  sorted(Path('.').rglob('pom.xml'))
+          for path in files:
+              try:
+                  ET.parse(path)
+              except ET.ParseError as exc:
+                  bad.append(f"{path}: {exc}")
+          print(f"checked {len(files)} XML files")
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          PY
+
+      - name: Validate the API specifications
+        run: |
+          python - <<'PY'
+          import sys, yaml
+          from pathlib import Path
+          oas = yaml.safe_load(
+              Path('experience-booking-channel-api/api-spec/openapi.yaml').read_text(encoding='utf-8'))
+          paths = list(oas['paths'])
+          print('OpenAPI paths:', paths)
+          missing = [p for p in ('/health', '/properties', '/properties/{propertyId}/quote')
+                     if p not in paths]
+          if missing:
+              sys.exit(f'specification is missing: {missing}')
+          for name in ('Quote', 'PropertyList', 'Error', 'Money', 'QuoteNight', 'Property'):
+              if name not in oas['components']['schemas']:
+                  sys.exit(f'component schema missing: {name}')
+          # The RAML is not parsed here (no RAML parser without the Mule toolchain);
+          # it is validated by APIKit at deploy time and by Design Center on import.
+          raml = Path('experience-booking-channel-api/src/main/resources/api/'
+                      'experience-booking-channel-api.raml').read_text(encoding='utf-8')
+          if not raml.startswith('#%RAML 1.0'):
+              sys.exit('RAML is missing its version header')
+          print('specifications look consistent')
+          PY
+
+      - name: Check no real configuration was committed
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E 'config-(dev|local|prod)\.yaml$' | grep -v '/src/test/resources/'; then
+            echo "A non-test config-*.yaml is tracked. Only config-example.yaml belongs in git." >&2
+            exit 1
+          fi
+          echo "no real configuration tracked"
+
+  # MUnit needs Anypoint credentials. Without them this job reports why and stops,
+  # rather than failing the build for a reason a reader cannot act on.
+  munit:
+    name: MUnit
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for Anypoint credentials
+        id: creds
+        env:
+          ANYPOINT_USERNAME: ${{ secrets.ANYPOINT_USERNAME }}
+        run: |
+          if [ -n "$ANYPOINT_USERNAME" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### MUnit skipped"
+              echo
+              echo "\`ANYPOINT_USERNAME\` / \`ANYPOINT_PASSWORD\` are not configured, so the"
+              echo "Mule runtime and MUnit plugins cannot be resolved from MuleSoft's"
+              echo "credentialed repositories."
+              echo
+              echo "See \`docs/setup.md\`, section 3, to add them."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.creds.outputs.available == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Write Maven settings
+        if: steps.creds.outputs.available == 'true'
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'XML'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+            <servers>
+              <server>
+                <id>anypoint-exchange-v3</id>
+                <username>${env.ANYPOINT_USERNAME}</username>
+                <password>${env.ANYPOINT_PASSWORD}</password>
+              </server>
+              <server>
+                <id>mule-ee-releases</id>
+                <username>${env.ANYPOINT_USERNAME}</username>
+                <password>${env.ANYPOINT_PASSWORD}</password>
+              </server>
+            </servers>
+          </settings>
+          XML
+
+      - name: Run MUnit
+        if: steps.creds.outputs.available == 'true'
+        env:
+          ANYPOINT_USERNAME: ${{ secrets.ANYPOINT_USERNAME }}
+          ANYPOINT_PASSWORD: ${{ secrets.ANYPOINT_PASSWORD }}
+        run: mvn -B -e clean test
+
+      - name: Upload MUnit reports
+        if: steps.creds.outputs.available == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: munit-reports
+          path: '**/target/munit-reports/**'
+          if-no-files-found: ignore

@@ -1,0 +1,33 @@
+# Test-scope configuration. Committed on purpose: it contains no secrets and
+# MUnit needs config-dev.yaml on the classpath to start the app under test.
+http:
+  host: "0.0.0.0"
+  port: "8083"
+  basePath: "/api/v1"
+
+systemApi:
+  property:
+    protocol: "HTTP"
+    host: "localhost"
+    port: "8081"
+    basePath: "/api/v1"
+    responseTimeoutMs: "6000"
+  rates:
+    protocol: "HTTP"
+    host: "localhost"
+    port: "8082"
+    basePath: "/api/v1"
+    responseTimeoutMs: "9000"
+
+pricing:
+  # Canonical output currency. Rates arriving in another currency are converted
+  # with the static table in dwl/fx-rates.dwl (a real system would call an FX API).
+  outputCurrency: "EUR"
+  defaultTaxRate: "0.10"
+  cache:
+    ttlSeconds: "300"
+
+resilience:
+  retry:
+    maxAttempts: "3"
+    initialBackoffMs: "500"

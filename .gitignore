@@ -1,0 +1,43 @@
+# Maven / Mule
+target/
+.mule/
+*.jar
+*.zip
+!.mvn/wrapper/maven-wrapper.jar
+
+# Anypoint Studio
+.project
+.classpath
+.settings/
+.factorypath
+.mule-artifact/
+
+# Real configuration -- never commit
+# Copy config-example.yaml -> config-dev.yaml locally; the real one is never committed.
+**/src/main/resources/config-dev.yaml
+**/src/main/resources/config-local.yaml
+**/src/main/resources/config-prod.yaml
+**/src/main/resources/*.secure.yaml
+.env
+*.secure.properties
+
+# .NET mocks
+bin/
+obj/
+
+# Python
+__pycache__/
+.venv/
+venv/
+*.pyc
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Mock runtime state
+.mocks/

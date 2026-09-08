@@ -1,0 +1,19 @@
+# Copy to config-dev.yaml and adjust. Never commit config-dev.yaml.
+http:
+  host: "0.0.0.0"
+  port: "8080"
+  basePath: "/channel/v1"
+
+processApi:
+  availability:
+    protocol: "HTTP"
+    host: "localhost"
+    port: "8083"
+    basePath: "/api/v1"
+    responseTimeoutMs: "10000"
+
+channel:
+  # Channel manager partners are identified by client_id injected by API Manager
+  # after the client-ID-enforcement policy runs. Never trust a raw header.
+  defaultPageSize: "20"
+  maxPageSize: "100"

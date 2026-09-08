@@ -1,0 +1,18 @@
+# Copy to config-dev.yaml and adjust. Never commit config-dev.yaml.
+http:
+  host: "0.0.0.0"
+  port: "8081"
+  basePath: "/api/v1"
+
+property:
+  backend:
+    protocol: "HTTP"
+    host: "localhost"
+    port: "5081"
+    basePath: "/backend/v1"
+    responseTimeoutMs: "5000"
+
+resilience:
+  retry:
+    maxAttempts: "3"
+    initialBackoffMs: "500"

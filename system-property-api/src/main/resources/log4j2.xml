@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Configuration status="WARN" name="mule">
+  <Appenders>
+    <!-- Structured JSON on stdout so CloudHub / Anypoint Monitoring and any
+         log shipper (ELK, Splunk) can index the fields instead of grepping text. -->
+    <Console name="json" target="SYSTEM_OUT">
+      <JsonTemplateLayout eventTemplateUri="classpath:log-template.json"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <AsyncLogger name="org.mule.runtime.core.internal.processor.LoggerMessageProcessor" level="INFO"/>
+    <AsyncLogger name="com.portfolio.property" level="DEBUG"/>
+    <AsyncRoot level="INFO">
+      <AppenderRef ref="json"/>
+    </AsyncRoot>
+  </Loggers>
+</Configuration>

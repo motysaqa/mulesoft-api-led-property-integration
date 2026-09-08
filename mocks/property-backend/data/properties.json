@@ -1,0 +1,62 @@
+[
+  {
+    "id": "PROP-1001",
+    "name": "Marina View Apartment",
+    "address": { "city": "Valencia", "countryCode": "es", "postalCode": "46011" },
+    "maxOccupancy": 4,
+    "bedrooms": 2,
+    "ratePlanCode": "STD",
+    "amenities": ["WIFI", "AC", "BALCONY", "KITCHEN"],
+    "status": "ACTIVE"
+  },
+  {
+    "id": "PROP-1002",
+    "name": "Old Town Studio",
+    "address": { "city": "Valencia", "countryCode": "es", "postalCode": "46001" },
+    "maxOccupancy": 2,
+    "bedrooms": 1,
+    "ratePlanCode": "STD",
+    "amenities": ["WIFI", "AC"],
+    "status": "ACTIVE"
+  },
+  {
+    "id": "PROP-1003",
+    "name": "Cliffside Villa",
+    "address": { "city": "Faro", "countryCode": "pt", "postalCode": "8000-000" },
+    "maxOccupancy": 8,
+    "bedrooms": 4,
+    "ratePlanCode": "PREMIUM",
+    "amenities": ["WIFI", "POOL", "PARK", "KITCHEN", "PETS"],
+    "status": "ACTIVE"
+  },
+  {
+    "id": "PROP-1004",
+    "name": "Canal House Loft",
+    "address": { "city": "Amsterdam", "countryCode": "nl", "postalCode": "1015" },
+    "maxOccupancy": 3,
+    "bedrooms": 1,
+    "ratePlanCode": "STD",
+    "amenities": ["WIFI", "KITCHEN"],
+    "status": "ACTIVE"
+  },
+  {
+    "id": "PROP-1005",
+    "name": "Harbour Penthouse",
+    "address": { "city": "Amsterdam", "countryCode": "nl", "postalCode": "1019" },
+    "maxOccupancy": 6,
+    "bedrooms": 3,
+    "ratePlanCode": "PREMIUM",
+    "amenities": ["WIFI", "AC", "PARK", "BALCONY"],
+    "status": "ACTIVE"
+  },
+  {
+    "id": "PROP-1006",
+    "name": "Renovation In Progress",
+    "address": { "city": "Faro", "countryCode": "pt", "postalCode": "8005-000" },
+    "maxOccupancy": 4,
+    "bedrooms": 2,
+    "ratePlanCode": "STD",
+    "amenities": ["WIFI"],
+    "status": "INACTIVE"
+  }
+]

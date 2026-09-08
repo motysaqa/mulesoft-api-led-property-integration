@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <global-property name="mule.env" value="dev"/>
+  <configuration-properties file="config-${mule.env}.yaml" doc:name="Environment properties"/>
+
+  <configuration defaultErrorHandler-ref="global-error-handler" doc:name="Runtime configuration"/>
+
+  <http:listener-config name="http-listener-config" doc:name="HTTP Listener">
+    <http:listener-connection host="${http.host}" port="${http.port}"/>
+  </http:listener-config>
+
+  <!--
+    APIKit routes against the RAML, so the specification is the contract at runtime:
+    an unknown path is a 404 and a malformed query parameter is a 400 before any of
+    our own code runs.
+  -->
+  <apikit:config name="experience-api-config"
+                 api="api/experience-booking-channel-api.raml"
+                 outboundHeadersMapName="outboundHeaders"
+                 httpStatusVarName="httpStatus"
+                 doc:name="APIKit Router"/>
+
+  <http:request-config name="process-api-config" doc:name="Process API">
+    <http:request-connection protocol="${processApi.availability.protocol}"
+                             host="${processApi.availability.host}"
+                             port="${processApi.availability.port}"/>
+    <http:default-headers>
+      <http:default-header key="Accept" value="application/json"/>
+      <http:default-header key="X-Correlation-ID" value="#[correlationId]"/>
+    </http:default-headers>
+  </http:request-config>
+
+  <error-handler name="global-error-handler" doc:name="Global error handler">
+
+    <!-- APIKit's own validation errors, mapped to the same envelope as everything else. -->
+    <on-error-propagate type="APIKIT:BAD_REQUEST" logException="false" doc:name="400 Spec violation">
+      <ee:transform doc:name="Bad request envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "BAD_REQUEST",
+  message: error.description default "The request does not match the API specification",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">400</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="APIKIT:NOT_FOUND, CHANNEL:NOT_FOUND" logException="false" doc:name="404 Not found">
+      <ee:transform doc:name="Not found envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "NOT_FOUND",
+  message: error.description default "The requested resource does not exist",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">404</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="APIKIT:METHOD_NOT_ALLOWED" logException="false" doc:name="405 Method not allowed">
+      <ee:transform doc:name="Method not allowed envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "METHOD_NOT_ALLOWED",
+  message: "That method is not defined for this resource",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">405</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="APIKIT:NOT_ACCEPTABLE" logException="false" doc:name="406 Not acceptable">
+      <ee:transform doc:name="Not acceptable envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "NOT_ACCEPTABLE",
+  message: "This API only produces application/json",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">406</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <!--
+      The process API already returns the shared error envelope. Rather than
+      re-wrapping it, its status and body are passed through so a partner sees one
+      consistent error contract and one correlation id end to end.
+    -->
+    <on-error-propagate type="HTTP:BAD_REQUEST, HTTP:NOT_FOUND, HTTP:UNAUTHORIZED, HTTP:FORBIDDEN"
+                        logException="false" doc:name="Pass through process API error">
+      <ee:transform doc:name="Relay downstream error">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var downstream = (error.errorMessage.payload default {}) as Object
+---
+{
+  code: downstream.error.code default "DOWNSTREAM_ERROR",
+  message: downstream.error.message default "The request could not be completed",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus"><![CDATA[#[error.errorMessage.attributes.statusCode default 400]]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="HTTP:TIMEOUT, HTTP:CONNECTIVITY, HTTP:BAD_GATEWAY, HTTP:SERVICE_UNAVAILABLE, HTTP:INTERNAL_SERVER_ERROR"
+                        logException="true" doc:name="502 Downstream failure">
+      <logger level="ERROR" doc:name="Log downstream failure"
+              message="#[output application/json --- { event: 'process_api_failure', correlationId: correlationId, errorType: error.errorType.identifier default 'UNKNOWN' }]"/>
+      <ee:transform doc:name="Downstream failure envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "SERVICE_UNAVAILABLE",
+  message: "The pricing service is temporarily unavailable. Please retry.",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">502</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+    <on-error-propagate type="ANY" logException="true" doc:name="500 Unexpected">
+      <ee:transform doc:name="Internal error envelope">
+        <ee:message>
+          <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  code: "INTERNAL_ERROR",
+  message: "An unexpected error occurred while processing the request",
+  correlationId: correlationId,
+  timestamp: now() as String {format: "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"}
+}]]></ee:set-payload>
+        </ee:message>
+        <ee:variables>
+          <ee:set-variable variableName="httpStatus">500</ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </on-error-propagate>
+
+  </error-handler>
+</mule>

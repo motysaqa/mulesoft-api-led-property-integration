@@ -1,0 +1,265 @@
+openapi: 3.0.3
+info:
+  title: Experience API - Booking Channel
+  version: "1.0.0"
+  description: |
+    OpenAPI 3.0 rendering of the channel-manager Experience API.
+
+    The RAML at `src/main/resources/api/experience-booking-channel-api.raml` is what
+    APIKit routes against at runtime. This document is the copy published to Anypoint
+    Exchange and the one `scripts/contract_tests.py` validates live responses against;
+    the two are kept deliberately equivalent and any change must be made in both.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.example.com/channel/v1
+    description: API Manager managed endpoint (placeholder host)
+  - url: http://localhost:8080/channel/v1
+    description: Local Anypoint Studio run
+
+security:
+  - clientId: []
+    clientSecret: []
+  - bearerAuth: []
+
+tags:
+  - name: properties
+    description: Search and price bookable inventory.
+  - name: operations
+    description: Probes and diagnostics.
+
+paths:
+  /health:
+    get:
+      tags: [operations]
+      summary: Liveness probe
+      description: Excluded from the client-ID-enforcement policy so monitors can reach it.
+      security: []
+      responses:
+        "200":
+          description: Application is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: UP }
+                  api: { type: string, example: experience-booking-channel-api }
+
+  /properties:
+    get:
+      tags: [properties]
+      summary: Search bookable properties
+      parameters:
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: city
+          in: query
+          required: false
+          schema: { type: string }
+        - name: minCapacity
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: pageSize
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Matching properties
+          headers:
+            X-Correlation-ID:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PropertyList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+  /properties/{propertyId}/quote:
+    get:
+      tags: [properties]
+      summary: Price a stay
+      description: |
+        Merges the availability calendar and the rate calendar behind a single call.
+        `sellable` is true only when every requested night is both open and priced.
+      parameters:
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: propertyId
+          in: path
+          required: true
+          schema: { type: string, example: PROP-1001 }
+        - name: checkIn
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-06-01" }
+        - name: checkOut
+          in: query
+          required: true
+          schema: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$', example: "2026-06-05" }
+        - name: guests
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 20, default: 2 }
+        - name: currency
+          in: query
+          required: false
+          schema: { type: string, pattern: '^[A-Z]{3}$', default: EUR }
+        - name: ratePlanCode
+          in: query
+          required: false
+          schema: { type: string, default: STD }
+      responses:
+        "200":
+          description: Quote for the requested stay
+          headers:
+            X-Correlation-ID:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Quote" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/BadGateway" }
+
+components:
+  securitySchemes:
+    clientId:
+      type: apiKey
+      in: header
+      name: client_id
+      description: Injected by the API Manager client-ID-enforcement policy.
+    clientSecret:
+      type: apiKey
+      in: header
+      name: client_secret
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Validated by the API Manager JWT validation policy before the app is reached.
+
+  parameters:
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Client-supplied request id. Generated if absent and always echoed back.
+      schema: { type: string }
+
+  schemas:
+    Money:
+      type: object
+      required: [amount, currency, formatted]
+      properties:
+        amount: { type: number, example: 148.50 }
+        currency: { type: string, pattern: '^[A-Z]{3}$', example: EUR }
+        formatted: { type: string, example: "€148.50" }
+
+    Property:
+      type: object
+      required: [propertyId, name, city, countryCode, capacity]
+      properties:
+        propertyId: { type: string, example: PROP-1001 }
+        name: { type: string, example: Marina View Apartment }
+        city: { type: string, example: Valencia }
+        countryCode: { type: string, pattern: '^[A-Z]{2}$', example: ES }
+        capacity: { type: integer, example: 4 }
+        bedrooms: { type: integer, example: 2 }
+        amenities:
+          type: array
+          items: { type: string }
+          example: ["Wi-Fi", "Air conditioning", "Balcony"]
+
+    PropertyList:
+      type: object
+      required: [items, page, pageSize, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Property" }
+        page: { type: integer, example: 1 }
+        pageSize: { type: integer, example: 20 }
+        total: { type: integer, example: 3 }
+
+    QuoteNight:
+      type: object
+      required: [date, dayOfWeek, available, restrictions]
+      properties:
+        date: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+        dayOfWeek: { type: string, example: Monday }
+        available: { type: boolean }
+        price:
+          allOf:
+            - $ref: "#/components/schemas/Money"
+          nullable: true
+        restrictions:
+          type: array
+          items: { type: string, enum: [CLOSED, MIN_STAY, CLOSED_TO_ARRIVAL] }
+
+    Quote:
+      type: object
+      required: [propertyId, checkIn, checkOut, nights, guests, sellable, nightly, totals, correlationId]
+      properties:
+        propertyId: { type: string }
+        checkIn: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+        checkOut: { type: string, pattern: '^\d{4}-\d{2}-\d{2}$' }
+        nights: { type: integer }
+        guests: { type: integer }
+        ratePlanCode: { type: string, example: STD }
+        sellable:
+          type: boolean
+          description: True only when every requested night is open and priced.
+        nightly:
+          type: array
+          items: { $ref: "#/components/schemas/QuoteNight" }
+        totals:
+          type: object
+          required: [subtotal, tax, total]
+          properties:
+            subtotal: { $ref: "#/components/schemas/Money" }
+            tax: { $ref: "#/components/schemas/Money" }
+            total: { $ref: "#/components/schemas/Money" }
+        unavailableDates:
+          type: array
+          items: { type: string }
+        correlationId: { type: string }
+
+    Error:
+      type: object
+      required: [code, message, correlationId, timestamp]
+      properties:
+        code: { type: string, example: BAD_REQUEST }
+        message: { type: string }
+        correlationId: { type: string }
+        timestamp: { type: string, format: date-time }
+
+  responses:
+    BadRequest:
+      description: The request could not be understood
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such property
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate limit exceeded (returned by the API Manager policy, not the app)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadGateway:
+      description: A downstream layer did not return a usable response
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

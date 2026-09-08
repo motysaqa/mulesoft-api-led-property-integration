@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:apikit="http://www.mulesoft.org/schema/mule/mule-apikit"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/mule-apikit http://www.mulesoft.org/schema/mule/mule-apikit/current/mule-apikit.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!--
+    EXPERIENCE API - Channel manager
+    One consumer, one shape. Everything here exists to make the partner's job easy:
+    checkIn/checkOut instead of from/to, a flat `price` object per night, and a
+    single `sellable` boolean instead of two calendars to reconcile.
+  -->
+
+  <flow name="experience-booking-channel-api-main" doc:name="APIKit main">
+    <http:listener config-ref="http-listener-config" path="${http.basePath}/*" doc:name="Listener">
+      <http:response statusCode="#[vars.httpStatus default 200]">
+        <http:headers><![CDATA[#[(vars.outboundHeaders default {}) ++ { "X-Correlation-ID": correlationId }]]]></http:headers>
+      </http:response>
+      <http:error-response statusCode="#[vars.httpStatus default 500]">
+        <http:headers><![CDATA[#[(vars.outboundHeaders default {}) ++ { "X-Correlation-ID": correlationId, "Content-Type": "application/json" }]]]></http:headers>
+      </http:error-response>
+    </http:listener>
+    <apikit:router config-ref="experience-api-config" doc:name="Route by specification"/>
+  </flow>
+
+  <flow name="get:\health:experience-api-config" doc:name="GET /health">
+    <ee:transform doc:name="Health payload">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ status: "UP", api: "experience-booking-channel-api" }]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="get:\properties:experience-api-config" doc:name="GET /properties">
+    <ee:transform doc:name="Capture paging parameters">
+      <ee:variables>
+        <ee:set-variable variableName="page"><![CDATA[#[(attributes.queryParams.page default "1") as Number]]]></ee:set-variable>
+        <ee:set-variable variableName="pageSize"><![CDATA[#[min([(attributes.queryParams.pageSize default p('channel.defaultPageSize')) as Number, p('channel.maxPageSize') as Number])]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <logger level="INFO" doc:name="Log request"
+            message="#[output application/json --- { event: 'request_received', api: 'experience-booking-channel-api', operation: 'searchProperties', correlationId: correlationId, clientId: attributes.headers['client_id'] default 'anonymous' }]"/>
+
+    <http:request method="GET" config-ref="process-api-config"
+                  path="${processApi.availability.basePath}/properties"
+                  responseTimeout="${processApi.availability.responseTimeoutMs}"
+                  doc:name="GET properties">
+      <http:query-params><![CDATA[#[attributes.queryParams filterObject ((v, k) -> ["city", "minCapacity"] contains (k as String))]]]></http:query-params>
+    </http:request>
+
+    <ee:transform doc:name="Canonical to channel shape">
+      <ee:message>
+        <ee:set-payload resource="dwl/properties-to-channel.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+  <flow name="get:\properties\(propertyId)\quote:experience-api-config" doc:name="GET /properties/{propertyId}/quote">
+    <ee:transform doc:name="Translate channel terms to process terms">
+      <ee:variables>
+        <!-- Partners think in check-in/check-out; the process layer thinks in ranges.
+             The last night charged is the night before check-out. -->
+        <ee:set-variable variableName="propertyId"><![CDATA[#[attributes.uriParams.propertyId]]]></ee:set-variable>
+        <ee:set-variable variableName="checkIn"><![CDATA[#[attributes.queryParams.checkIn]]]></ee:set-variable>
+        <ee:set-variable variableName="checkOut"><![CDATA[#[attributes.queryParams.checkOut]]]></ee:set-variable>
+        <ee:set-variable variableName="lastNight"><![CDATA[#[((attributes.queryParams.checkOut as Date) - |P1D|) as String {format: "yyyy-MM-dd"}]]]></ee:set-variable>
+        <ee:set-variable variableName="guests"><![CDATA[#[(attributes.queryParams.guests default "2") as Number]]]></ee:set-variable>
+        <ee:set-variable variableName="currency"><![CDATA[#[upper(attributes.queryParams.currency default "EUR")]]]></ee:set-variable>
+        <ee:set-variable variableName="ratePlanCode"><![CDATA[#[attributes.queryParams.ratePlanCode default "STD"]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <choice doc:name="Stay at least one night?">
+      <when expression="#[attributes.queryParams.checkOut &lt;= attributes.queryParams.checkIn]">
+        <raise-error type="APIKIT:BAD_REQUEST"
+                     description="checkOut must be at least one day after checkIn"
+                     doc:name="Raise 400"/>
+      </when>
+      <otherwise>
+        <logger level="INFO" doc:name="Log request"
+                message="#[output application/json --- { event: 'request_received', api: 'experience-booking-channel-api', operation: 'quote', correlationId: correlationId, propertyId: vars.propertyId, nights: (vars.checkOut as Date) - (vars.checkIn as Date), clientId: attributes.headers['client_id'] default 'anonymous' }]"/>
+      </otherwise>
+    </choice>
+
+    <http:request method="GET" config-ref="process-api-config"
+                  path="${processApi.availability.basePath}/properties/{propertyId}/availability-pricing"
+                  responseTimeout="${processApi.availability.responseTimeoutMs}"
+                  doc:name="GET availability-pricing">
+      <http:uri-params><![CDATA[#[{ propertyId: vars.propertyId }]]]></http:uri-params>
+      <http:query-params><![CDATA[#[{
+        from: vars.checkIn,
+        to: vars.lastNight,
+        guests: vars.guests,
+        currency: vars.currency,
+        ratePlanCode: vars.ratePlanCode
+      }]]]></http:query-params>
+    </http:request>
+
+    <ee:transform doc:name="Canonical to channel quote">
+      <ee:message>
+        <ee:set-payload resource="dwl/quote-to-channel.dwl"/>
+      </ee:message>
+    </ee:transform>
+  </flow>
+
+</mule>

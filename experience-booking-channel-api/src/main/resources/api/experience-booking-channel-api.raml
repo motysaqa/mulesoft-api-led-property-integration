@@ -1,0 +1,224 @@
+#%RAML 1.0
+title: Experience API - Booking Channel
+version: v1
+baseUri: https://api.example.com/channel/{version}
+mediaType: application/json
+description: |
+  Channel-manager facing API for a property booking platform.
+
+  This is the only layer a partner ever calls. It is shaped for one consumer:
+  flat responses, partner-friendly field names, and a single quote call that
+  answers "can I sell these nights and for how much" without the partner having
+  to understand availability and rate calendars separately.
+
+  Security is enforced by API Manager policies in front of the app
+  (client ID enforcement + JWT validation), not by this specification.
+
+types:
+  Money:
+    type: object
+    properties:
+      amount: number
+      currency:
+        type: string
+        pattern: ^[A-Z]{3}$
+      formatted: string
+
+  Property:
+    type: object
+    properties:
+      propertyId: string
+      name: string
+      city: string
+      countryCode:
+        type: string
+        pattern: ^[A-Z]{2}$
+      capacity: integer
+      bedrooms: integer
+      amenities:
+        type: array
+        items: string
+    example:
+      propertyId: PROP-1001
+      name: Marina View Apartment
+      city: Valencia
+      countryCode: ES
+      capacity: 4
+      bedrooms: 2
+      amenities: [ "Wi-Fi", "Air conditioning", "Balcony" ]
+
+  PropertyList:
+    type: object
+    properties:
+      items:
+        type: array
+        items: Property
+      page: integer
+      pageSize: integer
+      total: integer
+
+  QuoteNight:
+    type: object
+    properties:
+      date:
+        type: string
+        pattern: ^\d{4}-\d{2}-\d{2}$
+      dayOfWeek: string
+      available: boolean
+      price:
+        type: Money
+        required: false
+      restrictions:
+        type: array
+        items: string
+
+  Quote:
+    type: object
+    properties:
+      propertyId: string
+      checkIn:
+        type: string
+        pattern: ^\d{4}-\d{2}-\d{2}$
+      checkOut:
+        type: string
+        pattern: ^\d{4}-\d{2}-\d{2}$
+      nights: integer
+      guests: integer
+      sellable: boolean
+      nightly:
+        type: array
+        items: QuoteNight
+      totals:
+        type: object
+        properties:
+          subtotal: Money
+          tax: Money
+          total: Money
+      unavailableDates:
+        type: array
+        items: string
+      correlationId: string
+
+  Error:
+    type: object
+    properties:
+      code: string
+      message: string
+      correlationId: string
+      timestamp: string
+    example:
+      code: BAD_REQUEST
+      message: "checkOut must be after checkIn"
+      correlationId: 8f1c0b2e-0d1a-4f2b-9d55-2f6a1f0c9e77
+      timestamp: "2026-05-14T09:12:33.412+02:00"
+
+traits:
+  correlated:
+    headers:
+      X-Correlation-ID?:
+        description: Client-supplied request id. Generated and echoed back if absent.
+        type: string
+    responses:
+      200:
+        headers:
+          X-Correlation-ID: string
+
+  standardErrors:
+    responses:
+      400:
+        body:
+          application/json:
+            type: Error
+      404:
+        body:
+          application/json:
+            type: Error
+      429:
+        description: Rate limit exceeded (enforced by the API Manager policy).
+        body:
+          application/json:
+            type: Error
+      502:
+        body:
+          application/json:
+            type: Error
+
+/health:
+  get:
+    description: Liveness probe. Not subject to the client-ID policy.
+    responses:
+      200:
+        body:
+          application/json:
+            example:
+              status: UP
+              api: experience-booking-channel-api
+
+/properties:
+  get:
+    is: [ correlated, standardErrors ]
+    description: Search bookable properties.
+    queryParameters:
+      city:
+        required: false
+        type: string
+      minCapacity:
+        required: false
+        type: integer
+        minimum: 1
+      page:
+        required: false
+        type: integer
+        minimum: 1
+        default: 1
+      pageSize:
+        required: false
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    responses:
+      200:
+        body:
+          application/json:
+            type: PropertyList
+
+  /{propertyId}:
+    uriParameters:
+      propertyId:
+        type: string
+        description: Canonical property identifier, e.g. PROP-1001.
+
+    /quote:
+      get:
+        is: [ correlated, standardErrors ]
+        description: |
+          Price a stay. Merges availability and rates behind one call so the
+          partner never has to reconcile two calendars.
+        queryParameters:
+          checkIn:
+            type: string
+            pattern: ^\d{4}-\d{2}-\d{2}$
+          checkOut:
+            type: string
+            pattern: ^\d{4}-\d{2}-\d{2}$
+          guests:
+            required: false
+            type: integer
+            minimum: 1
+            maximum: 20
+            default: 2
+          currency:
+            required: false
+            type: string
+            pattern: ^[A-Z]{3}$
+            default: EUR
+          ratePlanCode:
+            required: false
+            type: string
+            default: STD
+        responses:
+          200:
+            body:
+              application/json:
+                type: Quote

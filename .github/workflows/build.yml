@@ -39,7 +39,9 @@ jobs:
             sleep 1
           done
           curl -fsS "http://localhost:5081/backend/v1/properties?city=Valencia" | tee /dev/stderr | grep -q PROP-1001
-          curl -fsS -o /dev/null -w '%{http_code}\n' \
+          # No -f here: it makes curl exit 22 on a 4xx, and 404 is the status this
+          # assertion exists to observe.
+          curl -sS -o /dev/null -w '%{http_code}\n' \
             "http://localhost:5081/backend/v1/properties/NOPE/availability" | grep -q 404
           # A SOAP business error must come back as a fault with HTTP 500.
           cat > /tmp/getrates.xml <<'XML'

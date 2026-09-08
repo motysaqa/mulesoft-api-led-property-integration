@@ -1,0 +1,4 @@
+# Contract-test dependencies (scripts/contract_tests.py)
+requests==2.32.3
+PyYAML==6.0.2
+jsonschema==4.23.0

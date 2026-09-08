@@ -75,8 +75,8 @@ curl: (22) The requested URL returned error: 404
 **Cause:** the step asserting that an unknown property returns 404 was written as
 
 ```bash
-curl -fsS -o /dev/null -w '%{http_code}
-'   "http://localhost:5081/backend/v1/properties/NOPE/availability" | grep -q 404
+curl -fsS -o /dev/null -w '%{http_code}' \
+  "http://localhost:5081/backend/v1/properties/NOPE/availability" | grep -q 404
 ```
 
 `-f` makes curl exit 22 on any 4xx, so the one status the assertion existed to
